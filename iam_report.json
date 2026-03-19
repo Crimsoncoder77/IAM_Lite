@@ -1,0 +1,268 @@
+{
+  "generatedAt": "2026-03-19T22:52:11.751440Z",
+  "summary": {
+    "totalUsers": 7,
+    "totalAdmins": 5,
+    "inactiveUsers": 4,
+    "highRiskUsers": 4,
+    "securityIssues": 2
+  },
+  "highRiskUsers": [
+    {
+      "id": "u1",
+      "displayName": "Alice Admin",
+      "email": "alice@contoso.com",
+      "lastLogin": "2026-01-18T22:52:11Z",
+      "accountEnabled": true,
+      "daysSinceLogin": 60,
+      "isInactive": true,
+      "isAdmin": true,
+      "isHighRisk": true,
+      "isSecurityIssue": false,
+      "riskFlags": [
+        "INACTIVE",
+        "ADMIN",
+        "HIGH_RISK"
+      ],
+      "roles": [
+        "Global Administrator"
+      ]
+    },
+    {
+      "id": "u3",
+      "displayName": "Carol Clerk",
+      "email": "carol@contoso.com",
+      "lastLogin": "2026-02-02T22:52:11Z",
+      "accountEnabled": true,
+      "daysSinceLogin": 45,
+      "isInactive": true,
+      "isAdmin": true,
+      "isHighRisk": true,
+      "isSecurityIssue": false,
+      "riskFlags": [
+        "INACTIVE",
+        "ADMIN",
+        "HIGH_RISK"
+      ],
+      "roles": [
+        "Security Administrator"
+      ]
+    },
+    {
+      "id": "u4",
+      "displayName": "Dave Disabled",
+      "email": "dave@contoso.com",
+      "lastLogin": "2025-12-19T22:52:11Z",
+      "accountEnabled": false,
+      "daysSinceLogin": 90,
+      "isInactive": true,
+      "isAdmin": true,
+      "isHighRisk": true,
+      "isSecurityIssue": true,
+      "riskFlags": [
+        "INACTIVE",
+        "ADMIN",
+        "HIGH_RISK",
+        "SECURITY_ISSUE"
+      ],
+      "roles": [
+        "Global Administrator"
+      ]
+    },
+    {
+      "id": "u6",
+      "displayName": "Frank Former",
+      "email": "frank@contoso.com",
+      "lastLogin": "2025-11-19T22:52:11Z",
+      "accountEnabled": false,
+      "daysSinceLogin": 120,
+      "isInactive": true,
+      "isAdmin": true,
+      "isHighRisk": true,
+      "isSecurityIssue": true,
+      "riskFlags": [
+        "INACTIVE",
+        "ADMIN",
+        "HIGH_RISK",
+        "SECURITY_ISSUE"
+      ],
+      "roles": [
+        "User Administrator"
+      ]
+    }
+  ],
+  "securityIssues": [
+    {
+      "id": "u4",
+      "displayName": "Dave Disabled",
+      "email": "dave@contoso.com",
+      "lastLogin": "2025-12-19T22:52:11Z",
+      "accountEnabled": false,
+      "daysSinceLogin": 90,
+      "isInactive": true,
+      "isAdmin": true,
+      "isHighRisk": true,
+      "isSecurityIssue": true,
+      "riskFlags": [
+        "INACTIVE",
+        "ADMIN",
+        "HIGH_RISK",
+        "SECURITY_ISSUE"
+      ],
+      "roles": [
+        "Global Administrator"
+      ]
+    },
+    {
+      "id": "u6",
+      "displayName": "Frank Former",
+      "email": "frank@contoso.com",
+      "lastLogin": "2025-11-19T22:52:11Z",
+      "accountEnabled": false,
+      "daysSinceLogin": 120,
+      "isInactive": true,
+      "isAdmin": true,
+      "isHighRisk": true,
+      "isSecurityIssue": true,
+      "riskFlags": [
+        "INACTIVE",
+        "ADMIN",
+        "HIGH_RISK",
+        "SECURITY_ISSUE"
+      ],
+      "roles": [
+        "User Administrator"
+      ]
+    }
+  ],
+  "allUsers": [
+    {
+      "id": "u1",
+      "displayName": "Alice Admin",
+      "email": "alice@contoso.com",
+      "lastLogin": "2026-01-18T22:52:11Z",
+      "accountEnabled": true,
+      "daysSinceLogin": 60,
+      "isInactive": true,
+      "isAdmin": true,
+      "isHighRisk": true,
+      "isSecurityIssue": false,
+      "riskFlags": [
+        "INACTIVE",
+        "ADMIN",
+        "HIGH_RISK"
+      ],
+      "roles": [
+        "Global Administrator"
+      ]
+    },
+    {
+      "id": "u2",
+      "displayName": "Bob Builder",
+      "email": "bob@contoso.com",
+      "lastLogin": "2026-03-14T22:52:11Z",
+      "accountEnabled": true,
+      "daysSinceLogin": 5,
+      "isInactive": false,
+      "isAdmin": false,
+      "isHighRisk": false,
+      "isSecurityIssue": false,
+      "riskFlags": [],
+      "roles": []
+    },
+    {
+      "id": "u3",
+      "displayName": "Carol Clerk",
+      "email": "carol@contoso.com",
+      "lastLogin": "2026-02-02T22:52:11Z",
+      "accountEnabled": true,
+      "daysSinceLogin": 45,
+      "isInactive": true,
+      "isAdmin": true,
+      "isHighRisk": true,
+      "isSecurityIssue": false,
+      "riskFlags": [
+        "INACTIVE",
+        "ADMIN",
+        "HIGH_RISK"
+      ],
+      "roles": [
+        "Security Administrator"
+      ]
+    },
+    {
+      "id": "u4",
+      "displayName": "Dave Disabled",
+      "email": "dave@contoso.com",
+      "lastLogin": "2025-12-19T22:52:11Z",
+      "accountEnabled": false,
+      "daysSinceLogin": 90,
+      "isInactive": true,
+      "isAdmin": true,
+      "isHighRisk": true,
+      "isSecurityIssue": true,
+      "riskFlags": [
+        "INACTIVE",
+        "ADMIN",
+        "HIGH_RISK",
+        "SECURITY_ISSUE"
+      ],
+      "roles": [
+        "Global Administrator"
+      ]
+    },
+    {
+      "id": "u5",
+      "displayName": "Eve Executive",
+      "email": "eve@contoso.com",
+      "lastLogin": "2026-03-17T22:52:11Z",
+      "accountEnabled": true,
+      "daysSinceLogin": 2,
+      "isInactive": false,
+      "isAdmin": true,
+      "isHighRisk": false,
+      "isSecurityIssue": false,
+      "riskFlags": [
+        "ADMIN"
+      ],
+      "roles": [
+        "Exchange Administrator"
+      ]
+    },
+    {
+      "id": "u6",
+      "displayName": "Frank Former",
+      "email": "frank@contoso.com",
+      "lastLogin": "2025-11-19T22:52:11Z",
+      "accountEnabled": false,
+      "daysSinceLogin": 120,
+      "isInactive": true,
+      "isAdmin": true,
+      "isHighRisk": true,
+      "isSecurityIssue": true,
+      "riskFlags": [
+        "INACTIVE",
+        "ADMIN",
+        "HIGH_RISK",
+        "SECURITY_ISSUE"
+      ],
+      "roles": [
+        "User Administrator"
+      ]
+    },
+    {
+      "id": "u7",
+      "displayName": "Grace Ghost",
+      "email": "grace@contoso.com",
+      "lastLogin": null,
+      "accountEnabled": true,
+      "daysSinceLogin": null,
+      "isInactive": false,
+      "isAdmin": false,
+      "isHighRisk": false,
+      "isSecurityIssue": false,
+      "riskFlags": [],
+      "roles": []
+    }
+  ]
+}

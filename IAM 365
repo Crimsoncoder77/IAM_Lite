@@ -1,0 +1,767 @@
+"""
+=============================================================
+  Microsoft 365 IAM Analyzer — MVP Prototype
+=============================================================
+
+INSTALL DEPENDENCIES:
+    pip install requests msal openai python-dotenv
+
+SETUP .env FILE (or export manually):
+    M365_TENANT_ID=your-tenant-id
+    M365_CLIENT_ID=your-client-id
+    M365_CLIENT_SECRET=your-client-secret
+    OPENAI_API_KEY=your-openai-key  (optional, for AI summary)
+
+REQUIRED GRAPH API PERMISSIONS (Application permissions):
+    - User.Read.All
+    - Directory.Read.All
+    - RoleManagement.Read.Directory
+
+RUN:
+    python iam_m365.py
+
+OUTPUT:
+    - Console summary
+    - iam_report.json
+    - iam_dashboard.html
+=============================================================
+"""
+
+import os
+import json
+import sqlite3
+import datetime
+import requests
+from dotenv import load_dotenv
+
+# ── Load env vars ─────────────────────────────────────────
+load_dotenv()
+
+TENANT_ID     = os.getenv("M365_TENANT_ID", "")
+CLIENT_ID     = os.getenv("M365_CLIENT_ID", "")
+CLIENT_SECRET = os.getenv("M365_CLIENT_SECRET", "")
+OPENAI_KEY    = os.getenv("OPENAI_API_KEY", "")
+
+GRAPH_BASE    = "https://graph.microsoft.com/v1.0"
+INACTIVE_DAYS = 30          # days since last login → INACTIVE
+
+# ─────────────────────────────────────────────────────────
+# 1. AUTHENTICATION — client credentials flow
+# ─────────────────────────────────────────────────────────
+
+def get_access_token() -> str:
+    """Obtain a bearer token via OAuth2 client credentials."""
+    url = f"https://login.microsoftonline.com/{TENANT_ID}/oauth2/v2.0/token"
+    payload = {
+        "grant_type":    "client_credentials",
+        "client_id":     CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "scope":         "https://graph.microsoft.com/.default",
+    }
+    resp = requests.post(url, data=payload, timeout=30)
+    resp.raise_for_status()
+    token = resp.json().get("access_token", "")
+    if not token:
+        raise ValueError("Failed to obtain access token — check your credentials.")
+    print("✅  Authenticated with Microsoft Graph API")
+    return token
+
+
+# ─────────────────────────────────────────────────────────
+# 2. GRAPH API HELPERS
+# ─────────────────────────────────────────────────────────
+
+def graph_get(token: str, endpoint: str) -> list:
+    """GET a Graph endpoint, handling @odata.nextLink pagination."""
+    headers = {"Authorization": f"Bearer {token}"}
+    results = []
+    url = f"{GRAPH_BASE}{endpoint}"
+    while url:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        results.extend(data.get("value", []))
+        url = data.get("@odata.nextLink")          # follow pages
+    return results
+
+
+# ─────────────────────────────────────────────────────────
+# 3. DATA COLLECTION
+# ─────────────────────────────────────────────────────────
+
+def fetch_users(token: str) -> list:
+    """Pull all users with sign-in activity fields."""
+    # lastSignInDateTime requires AuditLog.Read.All OR
+    # signInActivity is in beta — fall back to createdDateTime if absent
+    raw = graph_get(
+        token,
+        "/users?$select=id,displayName,mail,userPrincipalName,"
+        "accountEnabled,signInActivity,createdDateTime"
+    )
+    users = []
+    for u in raw:
+        sign_in = u.get("signInActivity") or {}
+        last_login_raw = (
+            sign_in.get("lastSignInDateTime")
+            or u.get("createdDateTime")   # fallback
+        )
+        users.append({
+            "id":             u.get("id", ""),
+            "displayName":    u.get("displayName", ""),
+            "email":          u.get("mail") or u.get("userPrincipalName", ""),
+            "lastLogin":      last_login_raw,
+            "accountEnabled": u.get("accountEnabled", True),
+        })
+    print(f"✅  Fetched {len(users)} users")
+    return users
+
+
+def fetch_directory_roles(token: str) -> list:
+    """Pull activated directory roles."""
+    roles = graph_get(token, "/directoryRoles")
+    print(f"✅  Fetched {len(roles)} directory roles")
+    return roles
+
+
+def fetch_role_members(token: str, roles: list) -> list:
+    """For each role, fetch its members → return list of (roleName, userId)."""
+    assignments = []
+    for role in roles:
+        role_id   = role.get("id", "")
+        role_name = role.get("displayName", "Unknown Role")
+        try:
+            members = graph_get(token, f"/directoryRoles/{role_id}/members")
+            for m in members:
+                assignments.append({
+                    "roleName": role_name,
+                    "userId":   m.get("id", ""),
+                })
+        except Exception:
+            pass   # role may have no members — skip silently
+    print(f"✅  Fetched {len(assignments)} role assignments")
+    return assignments
+
+
+# ─────────────────────────────────────────────────────────
+# 4. DATABASE — SQLite
+# ─────────────────────────────────────────────────────────
+
+def init_db(db_path: str = "iam.db") -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id             TEXT PRIMARY KEY,
+            displayName    TEXT,
+            email          TEXT,
+            lastLogin      TEXT,
+            accountEnabled INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS roles (
+            roleName TEXT,
+            userId   TEXT,
+            PRIMARY KEY (roleName, userId)
+        );
+    """)
+    conn.commit()
+    return conn
+
+
+def save_users(conn: sqlite3.Connection, users: list):
+    c = conn.cursor()
+    c.execute("DELETE FROM users")
+    c.executemany(
+        "INSERT OR REPLACE INTO users VALUES (?,?,?,?,?)",
+        [(u["id"], u["displayName"], u["email"],
+          u["lastLogin"], int(u["accountEnabled"])) for u in users]
+    )
+    conn.commit()
+
+
+def save_roles(conn: sqlite3.Connection, assignments: list):
+    c = conn.cursor()
+    c.execute("DELETE FROM roles")
+    c.executemany(
+        "INSERT OR REPLACE INTO roles VALUES (?,?)",
+        [(a["roleName"], a["userId"]) for a in assignments]
+    )
+    conn.commit()
+
+
+# ─────────────────────────────────────────────────────────
+# 5. RISK LOGIC
+# ─────────────────────────────────────────────────────────
+
+def parse_date(dt_str: str | None) -> datetime.datetime | None:
+    if not dt_str:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ",
+                "%Y-%m-%dT%H:%M:%S+00:00"):
+        try:
+            return datetime.datetime.strptime(dt_str, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def analyze_risks(users: list, assignments: list) -> list:
+    """
+    Apply risk rules to each user.
+    Returns enriched user list with flags.
+    """
+    now       = datetime.datetime.utcnow()
+    admin_ids = {a["userId"] for a in assignments}  # set of user IDs with any role
+
+    # Build a map of userId → list of role names
+    roles_map: dict[str, list] = {}
+    for a in assignments:
+        roles_map.setdefault(a["userId"], []).append(a["roleName"])
+
+    enriched = []
+    for u in users:
+        last_login_dt = parse_date(u["lastLogin"])
+        days_since    = (now - last_login_dt).days if last_login_dt else None
+
+        is_inactive       = days_since is not None and days_since > INACTIVE_DAYS
+        is_admin          = u["id"] in admin_ids
+        is_high_risk      = is_inactive and is_admin
+        is_security_issue = (not u["accountEnabled"]) and is_admin
+
+        risk_flags = []
+        if is_inactive:       risk_flags.append("INACTIVE")
+        if is_admin:          risk_flags.append("ADMIN")
+        if is_high_risk:      risk_flags.append("HIGH_RISK")
+        if is_security_issue: risk_flags.append("SECURITY_ISSUE")
+
+        enriched.append({
+            **u,
+            "daysSinceLogin":   days_since,
+            "isInactive":       is_inactive,
+            "isAdmin":          is_admin,
+            "isHighRisk":       is_high_risk,
+            "isSecurityIssue":  is_security_issue,
+            "riskFlags":        risk_flags,
+            "roles":            roles_map.get(u["id"], []),
+        })
+
+    return enriched
+
+
+# ─────────────────────────────────────────────────────────
+# 6. REPORTING
+# ─────────────────────────────────────────────────────────
+
+def build_report(enriched: list) -> dict:
+    total         = len(enriched)
+    admins        = [u for u in enriched if u["isAdmin"]]
+    inactive      = [u for u in enriched if u["isInactive"]]
+    high_risk     = [u for u in enriched if u["isHighRisk"]]
+    sec_issues    = [u for u in enriched if u["isSecurityIssue"]]
+
+    return {
+        "generatedAt":       datetime.datetime.utcnow().isoformat() + "Z",
+        "summary": {
+            "totalUsers":        total,
+            "totalAdmins":       len(admins),
+            "inactiveUsers":     len(inactive),
+            "highRiskUsers":     len(high_risk),
+            "securityIssues":    len(sec_issues),
+        },
+        "highRiskUsers":     high_risk,
+        "securityIssues":    sec_issues,
+        "allUsers":          enriched,
+    }
+
+
+def print_summary(report: dict):
+    s = report["summary"]
+    print("\n" + "═" * 52)
+    print("  📊  Microsoft 365 IAM Report")
+    print("═" * 52)
+    print(f"  Total users        : {s['totalUsers']}")
+    print(f"  Total admins       : {s['totalAdmins']}")
+    print(f"  Inactive users     : {s['inactiveUsers']}  (>{INACTIVE_DAYS} days)")
+    print(f"  High-risk accounts : {s['highRiskUsers']}  (inactive + admin)")
+    print(f"  Security issues    : {s['securityIssues']}  (disabled + has roles)")
+    print("─" * 52)
+
+    if report["highRiskUsers"]:
+        print("  ⚠️  HIGH-RISK USERS:")
+        for u in report["highRiskUsers"]:
+            days = u.get("daysSinceLogin", "?")
+            print(f"    • {u['displayName']} <{u['email']}>"
+                  f"  [{days}d ago]  Roles: {', '.join(u['roles'])}")
+
+    if report["securityIssues"]:
+        print("  🚨  SECURITY ISSUES (disabled account still holds roles):")
+        for u in report["securityIssues"]:
+            print(f"    • {u['displayName']} <{u['email']}>"
+                  f"  Roles: {', '.join(u['roles'])}")
+
+    print("═" * 52 + "\n")
+
+
+def save_json_report(report: dict, path: str = "iam_report.json"):
+    with open(path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+    print(f"📄  JSON report saved → {path}")
+
+
+# ─────────────────────────────────────────────────────────
+# 7. HTML DASHBOARD
+# ─────────────────────────────────────────────────────────
+
+def generate_html_dashboard(report: dict, path: str = "iam_dashboard.html"):
+    s        = report["summary"]
+    hr_users = report["highRiskUsers"]
+    si_users = report["securityIssues"]
+    all_u    = report["allUsers"]
+    gen_at   = report["generatedAt"]
+
+    def risk_badge(flags: list) -> str:
+        if not flags:
+            return '<span class="badge badge-ok">CLEAN</span>'
+        colors = {
+            "HIGH_RISK":      "badge-danger",
+            "SECURITY_ISSUE": "badge-danger",
+            "INACTIVE":       "badge-warn",
+            "ADMIN":          "badge-admin",
+        }
+        out = []
+        for f in flags:
+            cls = colors.get(f, "badge-ok")
+            out.append(f'<span class="badge {cls}">{f}</span>')
+        return " ".join(out)
+
+    rows = ""
+    for u in all_u:
+        enabled_icon = "✅" if u["accountEnabled"] else "🚫"
+        days = f"{u['daysSinceLogin']}d" if u["daysSinceLogin"] is not None else "N/A"
+        role_str = ", ".join(u["roles"]) if u["roles"] else "—"
+        rows += f"""
+        <tr class="{'high-risk-row' if u['isHighRisk'] or u['isSecurityIssue'] else ''}">
+          <td>{enabled_icon}</td>
+          <td>{u['displayName']}</td>
+          <td class="mono">{u['email']}</td>
+          <td class="center">{days}</td>
+          <td class="role-cell">{role_str}</td>
+          <td>{risk_badge(u['riskFlags'])}</td>
+        </tr>"""
+
+    ai_block = ""
+    if report.get("aiSummary"):
+        ai_block = f"""
+        <div class="ai-box">
+          <div class="ai-label">🤖 AI Security Summary</div>
+          <p>{report['aiSummary']}</p>
+        </div>"""
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>M365 IAM Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {{
+    --bg:       #0d0f14;
+    --surface:  #161a22;
+    --border:   #252b38;
+    --accent:   #4f9eff;
+    --danger:   #ff4d6d;
+    --warn:     #ffb347;
+    --ok:       #42d9a0;
+    --admin:    #c084fc;
+    --text:     #e2e8f0;
+    --muted:    #64748b;
+    --font:     'IBM Plex Sans', sans-serif;
+    --mono:     'IBM Plex Mono', monospace;
+  }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    min-height: 100vh;
+    padding: 0 0 60px;
+  }}
+
+  /* ── Header ── */
+  header {{
+    background: linear-gradient(135deg, #0d1117 0%, #161a22 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 28px 40px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }}
+  .logo {{ display: flex; align-items: center; gap: 12px; }}
+  .logo-icon {{
+    width: 40px; height: 40px;
+    background: var(--accent);
+    border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px;
+  }}
+  h1 {{ font-size: 1.4rem; font-weight: 700; letter-spacing: -.02em; }}
+  .tagline {{ font-size: .75rem; color: var(--muted); margin-top: 2px; font-family: var(--mono); }}
+  .gen-at {{ font-size: .75rem; color: var(--muted); font-family: var(--mono); }}
+
+  /* ── Main layout ── */
+  main {{ max-width: 1280px; margin: 0 auto; padding: 40px 40px 0; }}
+
+  /* ── Stat cards ── */
+  .stats {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 16px;
+    margin-bottom: 36px;
+  }}
+  .card {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 20px;
+    position: relative;
+    overflow: hidden;
+    transition: transform .15s, border-color .15s;
+  }}
+  .card:hover {{ transform: translateY(-2px); border-color: #333d52; }}
+  .card::before {{
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+  }}
+  .card-total::before  {{ background: var(--accent); }}
+  .card-admin::before  {{ background: var(--admin); }}
+  .card-inactive::before {{ background: var(--warn); }}
+  .card-highrisk::before {{ background: var(--danger); }}
+  .card-secissue::before {{ background: #ff2244; }}
+  .card-num {{
+    font-size: 2.8rem;
+    font-weight: 700;
+    font-family: var(--mono);
+    line-height: 1;
+    margin-bottom: 6px;
+  }}
+  .card-total .card-num  {{ color: var(--accent); }}
+  .card-admin .card-num  {{ color: var(--admin); }}
+  .card-inactive .card-num {{ color: var(--warn); }}
+  .card-highrisk .card-num {{ color: var(--danger); }}
+  .card-secissue .card-num {{ color: #ff2244; }}
+  .card-label {{ font-size: .8rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }}
+
+  /* ── AI box ── */
+  .ai-box {{
+    background: linear-gradient(135deg, #1a1f2e, #1e2436);
+    border: 1px solid #2d3a5e;
+    border-radius: 12px;
+    padding: 24px 28px;
+    margin-bottom: 36px;
+  }}
+  .ai-label {{ font-size: .75rem; font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: .1em; margin-bottom: 10px; }}
+  .ai-box p {{ line-height: 1.7; color: #b0c4e8; font-size: .95rem; }}
+
+  /* ── Section headers ── */
+  .section-title {{
+    font-size: .75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .12em;
+    color: var(--muted);
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }}
+
+  /* ── Table ── */
+  .table-wrap {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 36px;
+  }}
+  table {{ width: 100%; border-collapse: collapse; font-size: .875rem; }}
+  thead tr {{ background: #1c2130; }}
+  th {{
+    text-align: left;
+    padding: 12px 16px;
+    font-size: .7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .1em;
+    color: var(--muted);
+  }}
+  td {{ padding: 11px 16px; border-top: 1px solid var(--border); vertical-align: middle; }}
+  tr:hover td {{ background: rgba(255,255,255,.02); }}
+  tr.high-risk-row td {{ background: rgba(255, 77, 109, .05); }}
+  tr.high-risk-row:hover td {{ background: rgba(255, 77, 109, .09); }}
+
+  .mono {{ font-family: var(--mono); font-size: .8rem; color: var(--muted); }}
+  .center {{ text-align: center; }}
+  .role-cell {{ font-size: .78rem; color: #94a3c8; }}
+
+  /* ── Badges ── */
+  .badge {{
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: .7rem;
+    font-weight: 700;
+    letter-spacing: .05em;
+    font-family: var(--mono);
+  }}
+  .badge-ok      {{ background: rgba(66,217,160,.15); color: var(--ok); }}
+  .badge-warn    {{ background: rgba(255,179,71,.15);  color: var(--warn); }}
+  .badge-danger  {{ background: rgba(255,77,109,.15);  color: var(--danger); }}
+  .badge-admin   {{ background: rgba(192,132,252,.15); color: var(--admin); }}
+
+  /* ── Filter bar ── */
+  .filter-bar {{
+    display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap;
+  }}
+  .filter-btn {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: .78rem;
+    font-weight: 600;
+    font-family: var(--font);
+    cursor: pointer;
+    transition: all .15s;
+  }}
+  .filter-btn:hover, .filter-btn.active {{
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }}
+  .filter-btn.active-danger {{
+    background: var(--danger);
+    border-color: var(--danger);
+    color: #fff;
+  }}
+
+  @media (max-width: 700px) {{
+    header {{ padding: 20px; flex-direction: column; gap: 10px; align-items: flex-start; }}
+    main {{ padding: 20px; }}
+    .card-num {{ font-size: 2rem; }}
+  }}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">🛡️</div>
+    <div>
+      <h1>M365 IAM Analyzer</h1>
+      <div class="tagline">Identity & Access Risk Dashboard</div>
+    </div>
+  </div>
+  <div class="gen-at">Generated: {gen_at}</div>
+</header>
+
+<main>
+
+  <!-- Stat Cards -->
+  <div class="stats">
+    <div class="card card-total">
+      <div class="card-num">{s['totalUsers']}</div>
+      <div class="card-label">Total Users</div>
+    </div>
+    <div class="card card-admin">
+      <div class="card-num">{s['totalAdmins']}</div>
+      <div class="card-label">Admin Accounts</div>
+    </div>
+    <div class="card card-inactive">
+      <div class="card-num">{s['inactiveUsers']}</div>
+      <div class="card-label">Inactive (&gt;{INACTIVE_DAYS}d)</div>
+    </div>
+    <div class="card card-highrisk">
+      <div class="card-num">{s['highRiskUsers']}</div>
+      <div class="card-label">High Risk</div>
+    </div>
+    <div class="card card-secissue">
+      <div class="card-num">{s['securityIssues']}</div>
+      <div class="card-label">Security Issues</div>
+    </div>
+  </div>
+
+  {ai_block}
+
+  <!-- User Table -->
+  <div class="section-title">All Users ({s['totalUsers']})</div>
+
+  <div class="filter-bar">
+    <button class="filter-btn active" onclick="filterTable('all', this)">All</button>
+    <button class="filter-btn" onclick="filterTable('HIGH_RISK', this)" style="--hover: var(--danger)">High Risk</button>
+    <button class="filter-btn" onclick="filterTable('SECURITY_ISSUE', this)">Security Issues</button>
+    <button class="filter-btn" onclick="filterTable('INACTIVE', this)">Inactive</button>
+    <button class="filter-btn" onclick="filterTable('ADMIN', this)">Admins</button>
+  </div>
+
+  <div class="table-wrap">
+    <table id="userTable">
+      <thead>
+        <tr>
+          <th>Status</th>
+          <th>Name</th>
+          <th>Email</th>
+          <th class="center">Last Login</th>
+          <th>Roles</th>
+          <th>Risk Flags</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows}
+      </tbody>
+    </table>
+  </div>
+
+</main>
+
+<script>
+  function filterTable(flag, btn) {{
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const rows = document.querySelectorAll('#userTable tbody tr');
+    rows.forEach(row => {{
+      if (flag === 'all') {{
+        row.style.display = '';
+      }} else {{
+        const badges = row.querySelectorAll('.badge');
+        const flags  = Array.from(badges).map(b => b.textContent.trim());
+        row.style.display = flags.includes(flag) ? '' : 'none';
+      }}
+    }});
+  }}
+</script>
+</body>
+</html>"""
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(f"🌐  HTML dashboard saved → {path}")
+
+
+# ─────────────────────────────────────────────────────────
+# 8. BONUS — OpenAI security summary
+# ─────────────────────────────────────────────────────────
+
+def generate_ai_summary(report: dict) -> str:
+    """Call OpenAI to generate a plain-English security summary."""
+    if not OPENAI_KEY:
+        print("ℹ️   OPENAI_API_KEY not set — skipping AI summary")
+        return ""
+    try:
+        import openai
+        client = openai.OpenAI(api_key=OPENAI_KEY)
+        s = report["summary"]
+        prompt = (
+            f"You are a security analyst. Summarize the following Microsoft 365 IAM "
+            f"findings in 2-3 concise sentences for a non-technical manager:\n\n"
+            f"- Total users: {s['totalUsers']}\n"
+            f"- Admin accounts: {s['totalAdmins']}\n"
+            f"- Inactive users (>{INACTIVE_DAYS} days): {s['inactiveUsers']}\n"
+            f"- High-risk accounts (inactive admins): {s['highRiskUsers']}\n"
+            f"- Security issues (disabled accounts with roles): {s['securityIssues']}\n\n"
+            "Be direct and action-oriented."
+        )
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+        )
+        summary = resp.choices[0].message.content.strip()
+        print(f"🤖  AI Summary: {summary}")
+        return summary
+    except Exception as e:
+        print(f"⚠️   OpenAI call failed: {e}")
+        return ""
+
+
+# ─────────────────────────────────────────────────────────
+# 9. DEMO MODE — fake data if no credentials set
+# ─────────────────────────────────────────────────────────
+
+def fake_data() -> tuple[list, list]:
+    """Return synthetic data for testing without real M365 credentials."""
+    now = datetime.datetime.utcnow()
+
+    users = [
+        {"id": "u1", "displayName": "Alice Admin",    "email": "alice@contoso.com",
+         "lastLogin": (now - datetime.timedelta(days=60)).isoformat()+"Z", "accountEnabled": True},
+        {"id": "u2", "displayName": "Bob Builder",    "email": "bob@contoso.com",
+         "lastLogin": (now - datetime.timedelta(days=5)).isoformat()+"Z",  "accountEnabled": True},
+        {"id": "u3", "displayName": "Carol Clerk",    "email": "carol@contoso.com",
+         "lastLogin": (now - datetime.timedelta(days=45)).isoformat()+"Z", "accountEnabled": True},
+        {"id": "u4", "displayName": "Dave Disabled",  "email": "dave@contoso.com",
+         "lastLogin": (now - datetime.timedelta(days=90)).isoformat()+"Z", "accountEnabled": False},
+        {"id": "u5", "displayName": "Eve Executive",  "email": "eve@contoso.com",
+         "lastLogin": (now - datetime.timedelta(days=2)).isoformat()+"Z",  "accountEnabled": True},
+        {"id": "u6", "displayName": "Frank Former",   "email": "frank@contoso.com",
+         "lastLogin": (now - datetime.timedelta(days=120)).isoformat()+"Z","accountEnabled": False},
+        {"id": "u7", "displayName": "Grace Ghost",    "email": "grace@contoso.com",
+         "lastLogin": None, "accountEnabled": True},
+    ]
+
+    assignments = [
+        {"roleName": "Global Administrator",      "userId": "u1"},
+        {"roleName": "Global Administrator",      "userId": "u4"},  # disabled!
+        {"roleName": "User Administrator",        "userId": "u6"},  # disabled!
+        {"roleName": "Security Administrator",    "userId": "u3"},  # inactive
+        {"roleName": "Exchange Administrator",    "userId": "u5"},
+    ]
+
+    return users, assignments
+
+
+# ─────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────
+
+def main():
+    print("\n🚀  Starting M365 IAM Analyzer…\n")
+
+    # ── Determine mode ──────────────────────────────────
+    demo_mode = not (TENANT_ID and CLIENT_ID and CLIENT_SECRET)
+    if demo_mode:
+        print("⚠️   No M365 credentials found → running in DEMO MODE with fake data\n")
+        users, assignments = fake_data()
+    else:
+        # Live mode
+        token       = get_access_token()
+        users       = fetch_users(token)
+        roles       = fetch_directory_roles(token)
+        assignments = fetch_role_members(token, roles)
+
+    # ── Store ────────────────────────────────────────────
+    conn = init_db()
+    save_users(conn, users)
+    save_roles(conn, assignments)
+    conn.close()
+    print("💾  Data stored in iam.db")
+
+    # ── Analyze ──────────────────────────────────────────
+    enriched = analyze_risks(users, assignments)
+    report   = build_report(enriched)
+
+    # ── AI summary (optional) ────────────────────────────
+    report["aiSummary"] = generate_ai_summary(report)
+
+    # ── Output ───────────────────────────────────────────
+    print_summary(report)
+    save_json_report(report)
+    generate_html_dashboard(report)
+
+    print("✅  Done!\n")
+
+
+if __name__ == "__main__":
+    main()
